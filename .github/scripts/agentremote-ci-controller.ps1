@@ -41,6 +41,9 @@ if ($Mode -eq 'SelfCheck') {
     if ((Get-Phase @{} $null $false 1 10) -ne 'exited') { throw 'Stale ready from an exited node accepted' }
     if ((Get-Phase @{} $null $true 1 10) -ne 'ready') { throw 'Ready node rejected' }
     if ((Get-Phase $null $null $true 1 10) -ne 'waiting') { throw 'Missing ready accepted' }
+    $multiplePython = @([pscustomobject]@{Source='C:\Python312\python.exe'}, [pscustomobject]@{Source='C:\Python311\python.exe'})
+    $firstPython = ($multiplePython | Select-Object -First 1).Source
+    if ($firstPython -isnot [string] -or $firstPython -ne 'C:\Python312\python.exe') { throw 'Multiple Python matches did not resolve to one first executable' }
     '{"self_check":"passed","processes_started":false,"network_used":false}'
     exit 0
 }
@@ -82,7 +85,11 @@ function Owned-Process($identity) {
 if ($Mode -eq 'Start') {
     if (Test-Path -LiteralPath $identityPath) { throw 'A CI controller identity already exists.' }
     $null = New-Item -ItemType Directory -Path $outputPath -Force
-    $pythonExe = (Get-Command python -CommandType Application).Source
+    $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+    if ($pythonExe -isnot [string] -or -not [IO.Path]::IsPathRooted($pythonExe) -or
+        [IO.Path]::GetExtension($pythonExe) -ine '.exe' -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
+        throw 'Expected one existing absolute Python executable.'
+    }
     $process = Start-Process -FilePath $pythonExe -ArgumentList @('-B', ('"' + $scriptPath + '"'), '--apply') -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $outputPath 'node-private.stdout.log') `
         -RedirectStandardError (Join-Path $outputPath 'node-private.stderr.log')
