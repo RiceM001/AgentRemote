@@ -52,10 +52,15 @@ jobs:
         with:
           authkey: ${{ secrets.AGENTREMOTE }}
           hostname: ar-files-${{ github.run_id }}-${{ github.run_attempt }}
-          args: --accept-routes=false --accept-dns=false
+          args: --accept-dns=false
           version: latest
           use-cache: 'false'
           log-mode: quiet
+      - name: Disable subnet route acceptance on this disposable CI VM
+        shell: pwsh
+        run: |
+          tailscale set --accept-routes=false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot disable CI subnet route acceptance.' }
       - name: Start reviewed candidate and normal pairing in an owned CI process
         shell: pwsh
         env:
