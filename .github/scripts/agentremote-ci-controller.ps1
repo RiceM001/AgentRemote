@@ -101,11 +101,24 @@ if ($Mode -eq 'Start') {
         [IO.Path]::GetExtension($pythonExe) -ine '.exe' -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
         throw 'Expected one existing absolute Python executable.'
     }
-    $nodeMode = if ($Preflight) { '--preflight --wait-controller' } else { '--apply' }
+    $nodeArguments = if ($Preflight) { @('--preflight', '--wait-controller') } else { @('--apply') }
     if ($Preflight -and (Test-Path -LiteralPath (Join-Path $outputPath 'preflight-release'))) { throw 'Stale preflight release marker.' }
-    $process = Start-Process -FilePath $pythonExe -ArgumentList @('-B', ('"' + $scriptPath + '"'), $nodeMode) -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $outputPath 'node-private.stdout.log') `
-        -RedirectStandardError (Join-Path $outputPath 'node-private.stderr.log')
+    $launcher = @'
+import pathlib,subprocess,sys
+try:
+    output = pathlib.Path(sys.argv[2])
+    with (output / 'node-private.stdout.log').open('wb') as stdout, (output / 'node-private.stderr.log').open('wb') as stderr:
+        process = subprocess.Popen([sys.executable, '-B', sys.argv[1], *sys.argv[3:]],
+            stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
+    print(process.pid)
+except Exception:
+    raise SystemExit(1)
+'@
+    $childId = & $pythonExe -B -c $launcher $scriptPath $outputPath @nodeArguments 2> (Join-Path $outputPath 'launcher-private.stderr.log')
+    if ($LASTEXITCODE -ne 0 -or $childId -isnot [string] -or $childId -notmatch '^[1-9][0-9]*$') {
+        throw 'Cannot launch the owned interpreter.'
+    }
+    $process = Get-Process -Id ([int]$childId) -ErrorAction Stop
     $null = $process.Handle
     $identity = @{pid=$process.Id; ticks=$process.StartTime.ToUniversalTime().Ticks; executable=$process.Path;
         script=$scriptPath; script_sha256=(Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash; preflight=[bool]$Preflight}
