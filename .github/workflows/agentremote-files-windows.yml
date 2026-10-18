@@ -1,0 +1,95 @@
+name: AgentRemote independent Windows file validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: Reviewed and signature-verified AgentRemote candidate release ZIP URL
+        required: true
+        type: string
+      package_sha256:
+        description: SHA256 from the reviewed signed update manifest
+        required: true
+        type: string
+      operator_node:
+        description: Existing same-user operator Tailscale node ID
+        required: true
+        type: string
+      hold_seconds:
+        description: Available external file-controller window, 30 to 2700 seconds
+        required: true
+        default: 1800
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentremote-files-independent-windows
+  cancel-in-progress: false
+
+jobs:
+  independent-windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+      - name: Require existing same-user ephemeral credential
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.AGENTREMOTE }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw 'AGENTREMOTE repository secret must be configured by its owner; do not send it in chat or logs.'
+          }
+          if ($env:ACTIONS_STEP_DEBUG -eq 'true' -or $env:RUNNER_DEBUG -eq '1') {
+            throw 'Debug logging is disabled for credential-bearing network setup.'
+          }
+      - name: Join as an untagged user-owned ephemeral node
+        uses: tailscale/github-action@a44fb5f6e386b2fa54651d8b194209ffb0a1f968
+        with:
+          authkey: ${{ secrets.AGENTREMOTE }}
+          hostname: ar-files-${{ github.run_id }}-${{ github.run_attempt }}
+          args: --accept-routes=false --accept-dns=false
+          version: latest
+          use-cache: 'false'
+          log-mode: quiet
+      - name: Start reviewed candidate and normal pairing in an owned CI process
+        shell: pwsh
+        env:
+          AR_PACKAGE_URL: ${{ inputs.package_url }}
+          AR_PACKAGE_SHA256: ${{ inputs.package_sha256 }}
+          AR_OPERATOR_NODE: ${{ inputs.operator_node }}
+          AR_HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode Start
+      - name: Wait for normal pairing and sanitized readiness
+        shell: pwsh
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode WaitReady
+      - name: Publish readiness while the independent node is online
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: agentremote-file-ci-ready-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-output/ready.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Wait for the external file controller to finish
+        shell: pwsh
+        env:
+          AR_HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode WaitFinal -TimeoutSeconds ([int]$env:AR_HOLD_SECONDS + 300)
+      - name: Stop only this CI node worker and controller
+        if: always()
+        shell: pwsh
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode Stop
+      - name: Upload only sanitized readiness and file verification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: agentremote-file-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci-output/ready.json
+            ci-output/final.json
+          if-no-files-found: warn
+          retention-days: 7

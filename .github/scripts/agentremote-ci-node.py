@@ -1,0 +1,263 @@
+"""Disposable GitHub Windows node. Self-check is local; --apply requires GitHub hosting."""
+import argparse
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+
+
+def child(root, relative):
+    name = PurePosixPath(relative)
+    if not isinstance(relative, str) or '\\' in relative or ':' in relative or name.is_absolute() or '..' in name.parts:
+        raise ValueError('Unsafe archive path')
+    target = root.joinpath(*name.parts)
+    if not target.is_relative_to(root):
+        raise ValueError('Archive path escaped root')
+    return target
+
+
+def unpack(source, destination):
+    destination.mkdir()
+    with zipfile.ZipFile(source) as archive:
+        for entry in archive.infolist():
+            child(destination, entry.filename)
+            if ((entry.external_attr >> 16) & 0o170000) == 0o120000:
+                raise ValueError('Archive symlink refused')
+        archive.extractall(destination)
+
+
+def checked_identity(status, operator):
+    own = status.get('Self', {})
+    peer = next((row for row in (status.get('Peer') or {}).values() if row.get('ID') == operator), {})
+    if (status.get('BackendState') != 'Running' or not peer.get('Online') or not own.get('UserID')
+            or type(own['UserID']) is not type(peer.get('UserID')) or own['UserID'] != peer['UserID']
+            or own.get('Tags') or peer.get('Tags')):
+        raise ValueError('Expected online user-owned operator and untagged user-owned CI node')
+    node = own.get('ID', '')
+    if not re.fullmatch('[A-Za-z0-9]{1,64}', node) or node == operator:
+        raise ValueError('Independent CI node identity required')
+    address = next((value for value in own.get('TailscaleIPs', [])
+                    if ipaddress.ip_address(value) in ipaddress.ip_network('100.64.0.0/10')), None)
+    if address is None:
+        raise ValueError('CI node has no Tailnet IPv4')
+    return node, address
+
+
+def checked_url(value):
+    url = urllib.parse.urlsplit(value)
+    if (url.scheme != 'https' or url.hostname != 'github.com' or url.username or url.password or url.query or url.fragment
+            or not url.path.startswith('/RiceM001/AgentRemote/releases/download/') or not url.path.endswith('.zip')):
+        raise ValueError('Expected the reviewed AgentRemote release archive URL')
+    return value
+
+
+def write_json(path, value):
+    temporary = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=True), encoding='utf-8')
+    os.replace(temporary, path)
+
+
+def manifest_files(root, manifest):
+    for name, expected in manifest.items():
+        if not re.fullmatch('[0-9a-f]{64}', expected):
+            raise ValueError('Invalid resource digest')
+        path = child(root, name)
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                raise ValueError('Resource digest mismatch: ' + name)
+
+
+def self_check():
+    root = Path.cwd().resolve()
+    assert child(root, 'a/b.txt') == root / 'a/b.txt'
+    for value in ('../x', '/x', 'C:/x', 'a\\b', 'a/../../x'):
+        try:
+            child(root, value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Unsafe archive path accepted')
+    status = {'BackendState': 'Running', 'Self': {'ID': 'ci01', 'UserID': 42, 'TailscaleIPs': ['100.66.1.2']},
+              'Peer': {'key': {'ID': 'operator01', 'UserID': 42, 'Online': True}}}
+    assert checked_identity(status, 'operator01') == ('ci01', '100.66.1.2')
+    for fields in ({'UserID': 43}, {'UserID': '42'}, {'Tags': ['tag:ci']}, {'ID': 'operator01'}):
+        changed = {**status, 'Self': {**status['Self'], **fields}}
+        try:
+            checked_identity(changed, 'operator01')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Invalid CI identity accepted')
+    assert checked_url('https://github.com/RiceM001/AgentRemote/releases/download/v2.1.29/test.zip')
+    for url in ('http://github.com/RiceM001/AgentRemote/releases/download/v2.1.29/test.zip',
+                'https://github.com.evil.test/RiceM001/AgentRemote/releases/download/v2.1.29/test.zip',
+                'https://token@github.com/RiceM001/AgentRemote/releases/download/v2.1.29/test.zip',
+                'https://github.com/RiceM001/AgentRemote/releases/download/v2.1.29/test.zip?token=secret',
+                'https://github.com/another/repo/releases/download/v1/test.zip'):
+        try:
+            checked_url(url)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Unsafe package URL accepted')
+    print(json.dumps({'self_check': 'passed', 'network_used': False, 'processes_started': False}))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--package-url', default=os.environ.get('AR_PACKAGE_URL', ''))
+    parser.add_argument('--package-sha256', default=os.environ.get('AR_PACKAGE_SHA256', ''))
+    parser.add_argument('--operator-node', default=os.environ.get('AR_OPERATOR_NODE', ''))
+    parser.add_argument('--hold-seconds', type=int, default=int(os.environ.get('AR_HOLD_SECONDS', '1800')))
+    parser.add_argument('--fixture-bytes', type=int, default=int(os.environ.get('AR_FIXTURE_BYTES', '67108864')))
+    parser.add_argument('--poll-seconds', type=float, default=2)
+    parser.add_argument('--request-timeout-seconds', type=int, default=30)
+    args = parser.parse_args()
+    self_check()
+    if not args.apply:
+        print(json.dumps({'plan': 'GitHub-hosted Windows only; fresh profile; normal pairing; file calls only'}))
+        return
+    if not (os.name == 'nt' and os.environ.get('GITHUB_ACTIONS') == 'true'
+            and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and os.environ.get('RUNNER_OS') == 'Windows'):
+        raise ValueError('Refuse to bootstrap on a local or self-hosted computer')
+    if not (re.fullmatch('[0-9a-f]{64}', args.package_sha256) and re.fullmatch('[A-Za-z0-9]{1,64}', args.operator_node)
+            and 30 <= args.hold_seconds <= 2700 and 0 < args.poll_seconds <= 10 and 1 <= args.request_timeout_seconds <= 120
+            and 1 <= args.fixture_bytes <= 1073741824):
+        raise ValueError('Invalid CI input')
+    checked_url(args.package_url)
+    nonce = uuid.uuid4().hex
+    work = Path(os.environ['RUNNER_TEMP']).resolve() / ('agentremote-file-ci-' + nonce)
+    work.mkdir()
+    output = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-output'
+    output.mkdir(exist_ok=True)
+    write_json(output / 'boot-private.json', {'run_nonce': nonce, 'fixture_root': str(work / 'fixtures')})
+    state_parent = work / 'profile'
+    state_parent.mkdir()
+    state = state_parent / 'WinRemotePersistent'
+    env = {**os.environ, 'LOCALAPPDATA': str(state_parent), 'PYTHONUTF8': '1'}
+    for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
+        env.pop(name, None)
+    cli = Path(os.environ['ProgramFiles']) / 'Tailscale/tailscale.exe'
+
+    def ts_status():
+        result = subprocess.run([str(cli), 'status', '--json'], capture_output=True, text=True,
+                                encoding='utf-8', timeout=args.request_timeout_seconds, check=True)
+        return json.loads(result.stdout)
+
+    node, address = checked_identity(ts_status(), args.operator_node)
+    archive_path = work / 'reviewed-package.zip'
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(args.package_url, timeout=args.request_timeout_seconds) as response, archive_path.open('xb') as stream:
+        while data := response.read(1024 * 1024):
+            stream.write(data)
+    with archive_path.open('rb') as stream:
+        if hashlib.file_digest(stream, 'sha256').hexdigest() != args.package_sha256:
+            raise ValueError('Reviewed package SHA256 mismatch')
+    unpack(archive_path, work / 'package')
+    bundles = list((work / 'package').glob('*/app/resources'))
+    if len(bundles) != 1:
+        raise ValueError('Ambiguous package resources')
+    bundle = bundles[0]
+    manifest_files(bundle, json.loads((bundle / 'resources.json').read_text(encoding='utf-8-sig')))
+    unpack(bundle / 'remote.zip', work / 'runtime')
+    roots = list((work / 'runtime').glob('*/manifest.json'))
+    if len(roots) != 1:
+        raise ValueError('Ambiguous runtime root')
+    runtime = roots[0].parent
+    manifest_files(runtime, json.loads(roots[0].read_text(encoding='utf-8-sig')))
+    python = runtime / 'runtime/python.exe'
+    settings = json.loads((bundle / 'installer-settings.json').read_text(encoding='utf-8-sig'))
+    settings['operator_node_id'] = args.operator_node
+    encoded = base64.b64encode(json.dumps(settings).encode()).decode()
+    fixtures = work / 'fixtures'
+    fixtures.mkdir()
+    for name in ('incoming', 'outgoing'):
+        (fixtures / name).mkdir()
+    (fixtures / 'outgoing/中文😀.txt').write_text('独立 Windows 节点文件传输', encoding='utf-8')
+    (fixtures / 'outgoing/zero.bin').touch()
+    with (fixtures / 'outgoing/chunks.bin').open('xb') as stream:
+        block = bytes(range(256)) * 4096
+        remaining = args.fixture_bytes
+        while remaining:
+            piece = block[:remaining]
+            stream.write(piece)
+            remaining -= len(piece)
+    timeout = settings['startup_timeout_seconds'] + settings['request_timeout_seconds']
+    for mode in ('preflight',):
+        result = subprocess.run([str(python), str(bundle / 'enroll-client.py'), mode, str(runtime), encoded],
+                                env=env, capture_output=True, timeout=timeout)
+        if result.returncode:
+            raise RuntimeError('Normal pairing preflight failed')
+    process = None
+    result = {'schema': 1, 'node_id': node, 'run_nonce': nonce, 'passed': False}
+    try:
+        with (work / 'worker.log').open('wb') as log:
+            process = subprocess.Popen([str(python), str(runtime / 'persistent.py'), '--serve'], cwd=runtime,
+                                       env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+            deadline = time.monotonic() + timeout
+            while not (state / 'connection.json').exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError('CI-owned service failed to start')
+                time.sleep(args.poll_seconds)
+            for mode in ('probe', 'pair'):
+                completed = subprocess.run([str(python), str(bundle / 'enroll-client.py'), mode, str(runtime), encoded],
+                                           env=env, capture_output=True, timeout=timeout)
+                if completed.returncode:
+                    raise RuntimeError('Normal authenticated pairing failed: ' + mode)
+            ready = {'schema': 1, 'node_id': node, 'ipv4': address, 'same_user_verified': True,
+                     'run_nonce': nonce, 'fixture_root': str(fixtures), 'package_sha256': args.package_sha256,
+                     'hold_seconds': args.hold_seconds, 'fixture_bytes': args.fixture_bytes,
+                     'desktop_tool_calls': 0}
+            write_json(output / 'ready.json', ready)
+            print('AGENTREMOTE_FILE_CI_READY ' + json.dumps(ready, ensure_ascii=True), flush=True)
+            deadline = time.monotonic() + args.hold_seconds
+            while time.monotonic() < deadline:
+                checked_identity(ts_status(), args.operator_node)
+                if process.poll() is not None:
+                    raise RuntimeError('CI-owned service exited')
+                marker = fixtures / 'finished.json'
+                if marker.exists():
+                    controller = json.loads(marker.read_text(encoding='utf-8'))
+                    if (controller.get('schema') != 1 or controller.get('run_nonce') != nonce
+                            or controller.get('controller_completed') is not True or controller.get('passed') is not True):
+                        raise ValueError('Controller result did not pass')
+                    result['controller_result'] = controller
+                    result['passed'] = True
+                    break
+                time.sleep(args.poll_seconds)
+            else:
+                raise TimeoutError('No completed controller result within the CI window')
+    except Exception as error:
+        result['error_type'] = type(error).__name__
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            (state / 'stop').touch()
+            try:
+                process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
+        result['fixture_sha256'] = {}
+        for path in fixtures.rglob('*'):
+            if path.is_file() and not path.is_symlink():
+                with path.open('rb') as stream:
+                    result['fixture_sha256'][path.relative_to(fixtures).as_posix()] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        result['desktop_tool_calls'] = 0
+        write_json(output / 'final.json', result)
+
+
+if __name__ == '__main__':
+    main()
