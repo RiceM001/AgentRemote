@@ -77,6 +77,22 @@ def manifest_files(root, manifest):
                 raise ValueError('Resource digest mismatch: ' + name)
 
 
+def wait_authenticated_probe(command, env, process, deadline, poll_seconds):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or process.poll() is not None:
+            raise RuntimeError('CI authenticated probe did not become ready before the startup deadline')
+        try:
+            completed = subprocess.run(command, env=env, capture_output=True, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('CI authenticated probe startup deadline expired') from None
+        if completed.returncode == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('CI authenticated probe completed after the startup deadline')
+            return
+        time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
+
+
 def self_check():
     root = Path.cwd().resolve()
     assert child(root, 'a/b.txt') == root / 'a/b.txt'
@@ -110,6 +126,31 @@ def self_check():
             pass
         else:
             raise AssertionError('Unsafe package URL accepted')
+    from unittest.mock import Mock, patch
+    process = Mock()
+    process.poll.return_value = None
+    with patch.object(subprocess, 'run', side_effect=[Mock(returncode=1), Mock(returncode=0)]) as run, \
+            patch.object(time, 'monotonic', return_value=0), patch.object(time, 'sleep') as sleep:
+        wait_authenticated_probe(['fixture-probe'], {}, process, 1, 0.25)
+        assert run.call_count == 2 and sleep.call_count == 1
+    with patch.object(subprocess, 'run', return_value=Mock(returncode=1)) as run, \
+            patch.object(time, 'monotonic', side_effect=[0, 0.5, 1]), patch.object(time, 'sleep'):
+        try:
+            wait_authenticated_probe(['fixture-probe'], {}, process, 1, 0.25)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('Probe deadline ignored')
+        assert run.call_count == 1
+    process.poll.return_value = 1
+    with patch.object(subprocess, 'run') as run, patch.object(time, 'monotonic', return_value=0):
+        try:
+            wait_authenticated_probe(['fixture-probe'], {}, process, 1, 0.25)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('Exited service accepted')
+        assert not run.called
     print(json.dumps({'self_check': 'passed', 'network_used': False, 'processes_started': False}))
 
 
@@ -211,11 +252,12 @@ def main():
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError('CI-owned service failed to start')
                 time.sleep(args.poll_seconds)
-            for mode in ('probe', 'pair'):
-                completed = subprocess.run([str(python), str(bundle / 'enroll-client.py'), mode, str(runtime), encoded],
-                                           env=env, capture_output=True, timeout=timeout)
-                if completed.returncode:
-                    raise RuntimeError('Normal authenticated pairing failed: ' + mode)
+            wait_authenticated_probe([str(python), str(bundle / 'enroll-client.py'), 'probe', str(runtime), encoded],
+                                     env, process, deadline, args.poll_seconds)
+            completed = subprocess.run([str(python), str(bundle / 'enroll-client.py'), 'pair', str(runtime), encoded],
+                                       env=env, capture_output=True, timeout=timeout)
+            if completed.returncode:
+                raise RuntimeError('Normal authenticated pairing failed: pair')
             ready = {'schema': 1, 'node_id': node, 'ipv4': address, 'same_user_verified': True,
                      'run_nonce': nonce, 'fixture_root': str(fixtures), 'package_sha256': args.package_sha256,
                      'hold_seconds': args.hold_seconds, 'fixture_bytes': args.fixture_bytes,
