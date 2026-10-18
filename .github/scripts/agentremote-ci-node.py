@@ -162,6 +162,7 @@ class SafeParser(argparse.ArgumentParser):
 def run(result):
     parser = SafeParser()
     parser.add_argument('--preflight', action='store_true')
+    parser.add_argument('--wait-controller', action='store_true')
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--package-url', default=os.environ.get('AR_PACKAGE_URL', ''))
     parser.add_argument('--package-sha256', default=os.environ.get('AR_PACKAGE_SHA256', ''))
@@ -175,6 +176,8 @@ def run(result):
     self_check()
     if args.apply and args.preflight:
         raise ValueError('Choose one execution mode')
+    if args.wait_controller and not args.preflight:
+        raise ValueError('Controller handshake is preflight-only')
     if not (args.apply or args.preflight):
         print(json.dumps({'plan': 'GitHub-hosted Windows only; fresh profile; normal pairing; file calls only'}))
         return
@@ -264,6 +267,14 @@ print(json.dumps(report))
             'AssertionError', 'AttributeError', 'TypeError', 'KeyError', 'FileNotFoundError') else 'EmbeddedImportError'
         raise RuntimeError('Embedded import failed')
     if args.preflight:
+        if args.wait_controller:
+            result['stage'] = 'controller_handshake'
+            deadline = time.monotonic() + args.request_timeout_seconds
+            while not (output / 'preflight-release').is_file():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Preflight controller handshake expired')
+                time.sleep(args.poll_seconds)
+            result['cross_step_identity_verified'] = True
         result.update(passed=True, stage='complete', mode='preflight', package_sha256=args.package_sha256,
                       private_network_used=False, service_started=False, desktop_tool_calls=0)
         return

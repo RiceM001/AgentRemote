@@ -27,34 +27,19 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           persist-credentials: false
-      - name: Run the real host and embedded Python startup without credentials
+      - name: Start the same controller without credentials
         shell: pwsh
         env:
           AR_PACKAGE_URL: ${{ inputs.package_url }}
           AR_PACKAGE_SHA256: ${{ inputs.package_sha256 }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $outputPath = Join-Path $env:GITHUB_WORKSPACE 'ci-output'
-          New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-          $finalPath = Join-Path $outputPath 'final.json'
-          try {
-            $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
-            if ($pythonExe -isnot [string] -or -not [IO.Path]::IsPathRooted($pythonExe) -or
-                [IO.Path]::GetExtension($pythonExe) -ine '.exe' -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
-              throw 'Invalid host Python executable'
-            }
-            $scriptPath = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/agentremote-ci-node.py'
-            $process = Start-Process -FilePath $pythonExe -ArgumentList @('-B', ('"' + $scriptPath + '"'), '--preflight') -PassThru -WindowStyle Hidden -Wait `
-              -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'ar-preflight.stdout') -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'ar-preflight.stderr')
-            if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $finalPath)) { throw 'Preflight failed' }
-            $final = Get-Content -LiteralPath $finalPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($final.passed -ne $true -or $final.mode -ne 'preflight') { throw 'Preflight did not pass' }
-          } catch {
-            if (-not (Test-Path -LiteralPath $finalPath)) {
-              @{schema=1; passed=$false; stage='host_launch'; error_type='HostLaunchFailed'} | ConvertTo-Json | Set-Content -LiteralPath $finalPath -Encoding utf8
-            }
-            throw 'Windows preflight failed; see sanitized final artifact.'
-          }
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode Start -Preflight
+      - name: Verify cross-step identity and release the preflight
+        shell: pwsh
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode WaitFinal -Preflight
+      - name: Stop only the owned preflight controller
+        if: always()
+        shell: pwsh
+        run: .github/scripts/agentremote-ci-controller.ps1 -Mode Stop -Preflight
       - name: Upload only the sanitized preflight report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

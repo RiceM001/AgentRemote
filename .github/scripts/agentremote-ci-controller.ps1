@@ -3,13 +3,15 @@ param(
     [string]$Mode = 'SelfCheck',
     [int]$TimeoutSeconds = 300,
     [double]$PollSeconds = 2,
-    [int]$ShutdownSeconds = 30
+    [int]$ShutdownSeconds = 30,
+    [switch]$Preflight
 )
 $ErrorActionPreference = 'Stop'
 
 function Assert-Identity($actual, $expected) {
+    $mode = if ($expected.preflight -eq $true) { '--preflight --wait-controller' } else { '--apply' }
     $command = '^"?' + [regex]::Escape($expected.executable) + '"?\s+-B\s+"?' +
-        [regex]::Escape($expected.script) + '"?\s+--apply\s*$'
+        [regex]::Escape($expected.script) + '"?\s+' + [regex]::Escape($mode) + '\s*$'
     if ($actual.pid -ne $expected.pid -or $actual.ticks -ne $expected.ticks -or
         $actual.executable -ine $expected.executable -or $actual.command -notmatch $command) {
         throw 'CI process identity mismatch; refusing to control it.'
@@ -28,6 +30,12 @@ if ($Mode -eq 'SelfCheck') {
     $expected = @{ pid = 123; ticks = 456; executable = 'C:\Python\python.exe'; script = 'C:\repo\node.py' }
     $valid = @{ pid = 123; ticks = 456; executable = 'C:\Python\python.exe'; command = '"C:\Python\python.exe" -B "C:\repo\node.py" --apply' }
     Assert-Identity $valid $expected
+    $preflightIdentity = $expected.Clone(); $preflightIdentity.preflight = $true
+    $preflightActual = $valid.Clone(); $preflightActual.command = $valid.command.Replace('--apply', '--preflight --wait-controller')
+    Assert-Identity $preflightActual $preflightIdentity
+    $rejected = $false
+    try { Assert-Identity $valid $preflightIdentity } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Different execution mode accepted' }
     foreach ($field in @('pid', 'ticks', 'executable', 'command')) {
         $bad = $valid.Clone()
         $bad[$field] = if ($field -in @('pid', 'ticks')) { 999 } else { 'foreign' }
@@ -67,6 +75,7 @@ function Read-Json($path) {
 }
 
 function Owned-Process($identity) {
+    if ([bool]$identity.preflight -ne [bool]$Preflight) { throw 'Controller execution mode mismatch.' }
     if ($identity.script -ine $scriptPath -or (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash -ine $identity.script_sha256) {
         throw 'CI script identity changed; refusing process control.'
     }
@@ -90,12 +99,14 @@ if ($Mode -eq 'Start') {
         [IO.Path]::GetExtension($pythonExe) -ine '.exe' -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
         throw 'Expected one existing absolute Python executable.'
     }
-    $process = Start-Process -FilePath $pythonExe -ArgumentList @('-B', ('"' + $scriptPath + '"'), '--apply') -PassThru -WindowStyle Hidden `
+    $nodeMode = if ($Preflight) { '--preflight --wait-controller' } else { '--apply' }
+    if ($Preflight -and (Test-Path -LiteralPath (Join-Path $outputPath 'preflight-release'))) { throw 'Stale preflight release marker.' }
+    $process = Start-Process -FilePath $pythonExe -ArgumentList @('-B', ('"' + $scriptPath + '"'), $nodeMode) -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $outputPath 'node-private.stdout.log') `
         -RedirectStandardError (Join-Path $outputPath 'node-private.stderr.log')
     $null = $process.Handle
     $identity = @{pid=$process.Id; ticks=$process.StartTime.ToUniversalTime().Ticks; executable=$process.Path;
-        script=$scriptPath; script_sha256=(Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash}
+        script=$scriptPath; script_sha256=(Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash; preflight=[bool]$Preflight}
     $identity | ConvertTo-Json | Set-Content -LiteralPath $identityPath -Encoding utf8
     $owned = Owned-Process $identity
     if ($null -eq $owned) { throw 'CI child exited at startup.' }
@@ -116,6 +127,9 @@ while ($true) {
     $alive = $null -ne $process
     $ready = Read-Json $readyPath
     $final = Read-Json $finalPath
+    if ($Preflight -and $Mode -eq 'WaitFinal' -and $alive) {
+        $null = New-Item -ItemType File -Path (Join-Path $outputPath 'preflight-release') -Force
+    }
     if ($Mode -eq 'Stop') {
         if (-not $alive) { break }
         $scope = if ($null -ne $ready) { $ready } else { Read-Json (Join-Path $outputPath 'boot-private.json') }
