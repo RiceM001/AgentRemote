@@ -39,10 +39,10 @@ jobs:
       - name: Require existing same-user ephemeral credential
         shell: pwsh
         env:
-          TS_AUTHKEY: ${{ secrets.AGENTREMOTE }}
+          TS_AUTHKEY: ${{ secrets.AR }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw 'AGENTREMOTE repository secret must be configured by its owner; do not send it in chat or logs.'
+            throw 'AR repository secret must be configured by its owner; do not send it in chat or logs.'
           }
           if ($env:ACTIONS_STEP_DEBUG -eq 'true' -or $env:RUNNER_DEBUG -eq '1') {
             throw 'Debug logging is disabled for credential-bearing network setup.'
@@ -50,7 +50,7 @@ jobs:
       - name: Join as an untagged user-owned ephemeral node
         uses: tailscale/github-action@a44fb5f6e386b2fa54651d8b194209ffb0a1f968
         with:
-          authkey: ${{ secrets.AGENTREMOTE }}
+          authkey: ${{ secrets.AR }}
           hostname: ar-files-${{ github.run_id }}-${{ github.run_attempt }}
           args: --accept-dns=false
           version: latest
