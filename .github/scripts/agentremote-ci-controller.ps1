@@ -4,7 +4,8 @@ param(
     [int]$TimeoutSeconds = 300,
     [double]$PollSeconds = 2,
     [int]$ShutdownSeconds = 30,
-    [switch]$Preflight
+    [switch]$Preflight,
+    [int]$StartupAckSeconds = 30
 )
 $ErrorActionPreference = 'Stop'
 
@@ -60,7 +61,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
     $env:RUNNER_OS -ne 'Windows' -or $PSVersionTable.Platform -ne 'Win32NT') {
     throw 'Refuse CI process control outside GitHub-hosted Windows.'
 }
-if ($TimeoutSeconds -lt 1 -or $TimeoutSeconds -gt 3300 -or $PollSeconds -le 0 -or $PollSeconds -gt 10 -or $ShutdownSeconds -lt 1) {
+if ($TimeoutSeconds -lt 1 -or $TimeoutSeconds -gt 3300 -or $PollSeconds -le 0 -or $PollSeconds -gt 10 -or $ShutdownSeconds -lt 1 -or $StartupAckSeconds -lt 1 -or $StartupAckSeconds -gt 120) {
     throw 'Invalid controller timeout configuration.'
 }
 $scriptPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '.github/scripts/agentremote-ci-node.py'))
@@ -93,6 +94,7 @@ function Owned-Process($identity) {
 
 if ($Mode -eq 'Start') {
     if (Test-Path -LiteralPath $identityPath) { throw 'A CI controller identity already exists.' }
+    if (Test-Path -LiteralPath (Join-Path $outputPath 'started.json')) { throw 'Stale interpreter startup marker.' }
     $null = New-Item -ItemType Directory -Path $outputPath -Force
     $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
     if ($pythonExe -isnot [string] -or -not [IO.Path]::IsPathRooted($pythonExe) -or
@@ -111,6 +113,29 @@ if ($Mode -eq 'Start') {
     $owned = Owned-Process $identity
     if ($null -eq $owned) { throw 'CI child exited at startup.' }
     $owned.Dispose()
+    $startupDeadline = [DateTimeOffset]::UtcNow.AddSeconds($StartupAckSeconds)
+    while (-not (Test-Path -LiteralPath (Join-Path $outputPath 'started.json'))) {
+        if ($process.WaitForExit([int]($PollSeconds * 1000))) {
+            if (-not (Test-Path -LiteralPath $finalPath)) {
+                @{schema=1; passed=$false; stage='host_interpreter'; error_type='InterpreterExitedBeforeAck';
+                  exit_code=$process.ExitCode; powershell_version=@($PSVersionTable.PSVersion.Major,$PSVersionTable.PSVersion.Minor,$PSVersionTable.PSVersion.Patch)} |
+                    ConvertTo-Json | Set-Content -LiteralPath $finalPath -Encoding utf8
+            }
+            throw 'Interpreter exited before safe startup acknowledgement.'
+        }
+        if ([DateTimeOffset]::UtcNow -ge $startupDeadline) {
+            if (-not (Test-Path -LiteralPath $finalPath)) {
+                @{schema=1; passed=$false; stage='host_interpreter'; error_type='InterpreterStartupTimeout'} |
+                    ConvertTo-Json | Set-Content -LiteralPath $finalPath -Encoding utf8
+            }
+            throw 'Interpreter startup acknowledgement timed out.'
+        }
+    }
+    $started = Read-Json (Join-Path $outputPath 'started.json')
+    if ($started.schema -ne 1 -or $started.runtime_version.host.Count -ne 3 -or
+        @($started.runtime_version.host | Where-Object { ($_ -isnot [int] -and $_ -isnot [long]) -or $_ -lt 0 }).Count) {
+        throw 'Invalid interpreter startup acknowledgement.'
+    }
     $process.Dispose()
     '{"ci_child_started":true}'
     exit 0
@@ -159,7 +184,8 @@ while ($true) {
     }
     if ($phase -in @('timeout', 'failed', 'exited')) {
         if ($null -eq $final) {
-            @{schema=1; passed=$false; error_type=('CIController_' + $phase)} | ConvertTo-Json | Set-Content -LiteralPath $finalPath -Encoding utf8
+            @{schema=1; passed=$false; error_type=('CIController_' + $phase);
+              startup_acknowledged=(Test-Path -LiteralPath (Join-Path $outputPath 'started.json'))} | ConvertTo-Json | Set-Content -LiteralPath $finalPath -Encoding utf8
         }
         throw ('CI controller state: ' + $phase)
     }

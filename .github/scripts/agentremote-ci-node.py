@@ -381,6 +381,7 @@ def main():
         if os.environ.get('GITHUB_ACTIONS') == 'true':
             output = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-output' / 'final.json'
             output.parent.mkdir(exist_ok=True)
+            write_json(output.with_name('started.json'), {'schema': 1, 'runtime_version': result['runtime_version']})
         run(result)
     except BaseException as error:
         if isinstance(error, SystemExit) and error.code == 0:
