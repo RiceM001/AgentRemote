@@ -154,8 +154,14 @@ def self_check():
     print(json.dumps({'self_check': 'passed', 'network_used': False, 'processes_started': False}))
 
 
-def main():
-    parser = argparse.ArgumentParser()
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError('Invalid CI arguments')
+
+
+def run(result):
+    parser = SafeParser()
+    parser.add_argument('--preflight', action='store_true')
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--package-url', default=os.environ.get('AR_PACKAGE_URL', ''))
     parser.add_argument('--package-sha256', default=os.environ.get('AR_PACKAGE_SHA256', ''))
@@ -165,14 +171,20 @@ def main():
     parser.add_argument('--poll-seconds', type=float, default=2)
     parser.add_argument('--request-timeout-seconds', type=int, default=30)
     args = parser.parse_args()
+    result['stage'] = 'self_check'
     self_check()
-    if not args.apply:
+    if args.apply and args.preflight:
+        raise ValueError('Choose one execution mode')
+    if not (args.apply or args.preflight):
         print(json.dumps({'plan': 'GitHub-hosted Windows only; fresh profile; normal pairing; file calls only'}))
         return
+    result['stage'] = 'environment'
+    if sys.version_info < (3, 11):
+        raise RuntimeError('Host Python 3.11 or newer required')
     if not (os.name == 'nt' and os.environ.get('GITHUB_ACTIONS') == 'true'
             and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and os.environ.get('RUNNER_OS') == 'Windows'):
         raise ValueError('Refuse to bootstrap on a local or self-hosted computer')
-    if not (re.fullmatch('[0-9a-f]{64}', args.package_sha256) and re.fullmatch('[A-Za-z0-9]{1,64}', args.operator_node)
+    if not (re.fullmatch('[0-9a-f]{64}', args.package_sha256) and (args.preflight or re.fullmatch('[A-Za-z0-9]{1,64}', args.operator_node))
             and 30 <= args.hold_seconds <= 2700 and 0 < args.poll_seconds <= 10 and 1 <= args.request_timeout_seconds <= 120
             and 1 <= args.fixture_bytes <= 1073741824):
         raise ValueError('Invalid CI input')
@@ -181,7 +193,6 @@ def main():
     work = Path(os.environ['RUNNER_TEMP']).resolve() / ('agentremote-file-ci-' + nonce)
     work.mkdir()
     output = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-output'
-    output.mkdir(exist_ok=True)
     write_json(output / 'boot-private.json', {'run_nonce': nonce, 'fixture_root': str(work / 'fixtures')})
     state_parent = work / 'profile'
     state_parent.mkdir()
@@ -196,7 +207,10 @@ def main():
                                 encoding='utf-8', timeout=args.request_timeout_seconds, check=True)
         return json.loads(result.stdout)
 
-    node, address = checked_identity(ts_status(), args.operator_node)
+    result['stage'] = 'identity'
+    if not args.preflight:
+        node, address = checked_identity(ts_status(), args.operator_node)
+    result['stage'] = 'download'
     archive_path = work / 'reviewed-package.zip'
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(args.package_url, timeout=args.request_timeout_seconds) as response, archive_path.open('xb') as stream:
@@ -205,12 +219,14 @@ def main():
     with archive_path.open('rb') as stream:
         if hashlib.file_digest(stream, 'sha256').hexdigest() != args.package_sha256:
             raise ValueError('Reviewed package SHA256 mismatch')
+    result['stage'] = 'package_manifest'
     unpack(archive_path, work / 'package')
     bundles = list((work / 'package').glob('*/app/resources'))
     if len(bundles) != 1:
         raise ValueError('Ambiguous package resources')
     bundle = bundles[0]
     manifest_files(bundle, json.loads((bundle / 'resources.json').read_text(encoding='utf-8-sig')))
+    result['stage'] = 'runtime_manifest'
     unpack(bundle / 'remote.zip', work / 'runtime')
     roots = list((work / 'runtime').glob('*/manifest.json'))
     if len(roots) != 1:
@@ -218,6 +234,40 @@ def main():
     runtime = roots[0].parent
     manifest_files(runtime, json.loads(roots[0].read_text(encoding='utf-8-sig')))
     python = runtime / 'runtime/python.exe'
+    result['stage'] = 'embedded_import'
+    probe = '''import contextlib,io,json,sys
+report = {'version': list(sys.version_info[:3]), 'passed': False}
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        sys.path.insert(0, sys.argv[1])
+        import persistent, interactive_server
+        assert persistent.config()
+        assert interactive_server.server.mcp is not None
+    report['passed'] = True
+except Exception as error:
+    report['error_type'] = type(error).__name__
+print(json.dumps(report))
+'''
+    completed = subprocess.run([str(python), '-B', '-c', probe, str(runtime)], cwd=runtime,
+                               env=env, capture_output=True, timeout=args.request_timeout_seconds)
+    if completed.returncode:
+        raise RuntimeError('Embedded import failed')
+    embedded = json.loads(completed.stdout)
+    version = embedded['version']
+    if not isinstance(version, list) or len(version) != 3 or any(type(v) is not int or v < 0 for v in version):
+        raise ValueError('Invalid embedded version')
+    result['runtime_version']['embedded'] = version
+    if embedded.get('passed') is not True:
+        error_type = embedded.get('error_type', '')
+        result['embedded_error_type'] = error_type if error_type in (
+            'ImportError', 'ModuleNotFoundError', 'OSError', 'ValueError', 'RuntimeError',
+            'AssertionError', 'AttributeError', 'TypeError', 'KeyError', 'FileNotFoundError') else 'EmbeddedImportError'
+        raise RuntimeError('Embedded import failed')
+    if args.preflight:
+        result.update(passed=True, stage='complete', mode='preflight', package_sha256=args.package_sha256,
+                      private_network_used=False, service_started=False, desktop_tool_calls=0)
+        return
+    result['stage'] = 'fixtures'
     settings = json.loads((bundle / 'installer-settings.json').read_text(encoding='utf-8-sig'))
     settings['operator_node_id'] = args.operator_node
     encoded = base64.b64encode(json.dumps(settings).encode()).decode()
@@ -235,13 +285,15 @@ def main():
             stream.write(piece)
             remaining -= len(piece)
     timeout = settings['startup_timeout_seconds'] + settings['request_timeout_seconds']
+    result['stage'] = 'pairing_preflight'
     for mode in ('preflight',):
-        result = subprocess.run([str(python), str(bundle / 'enroll-client.py'), mode, str(runtime), encoded],
+        completed = subprocess.run([str(python), str(bundle / 'enroll-client.py'), mode, str(runtime), encoded],
                                 env=env, capture_output=True, timeout=timeout)
-        if result.returncode:
+        if completed.returncode:
             raise RuntimeError('Normal pairing preflight failed')
     process = None
-    result = {'schema': 1, 'node_id': node, 'run_nonce': nonce, 'passed': False}
+    result.update(node_id=node, run_nonce=nonce)
+    result['stage'] = 'worker_start'
     try:
         with (work / 'worker.log').open('wb') as log:
             process = subprocess.Popen([str(python), str(runtime / 'persistent.py'), '--serve'], cwd=runtime,
@@ -254,6 +306,7 @@ def main():
                 time.sleep(args.poll_seconds)
             wait_authenticated_probe([str(python), str(bundle / 'enroll-client.py'), 'probe', str(runtime), encoded],
                                      env, process, deadline, args.poll_seconds)
+            result['stage'] = 'pair'
             completed = subprocess.run([str(python), str(bundle / 'enroll-client.py'), 'pair', str(runtime), encoded],
                                        env=env, capture_output=True, timeout=timeout)
             if completed.returncode:
@@ -264,6 +317,7 @@ def main():
                      'desktop_tool_calls': 0}
             write_json(output / 'ready.json', ready)
             print('AGENTREMOTE_FILE_CI_READY ' + json.dumps(ready, ensure_ascii=True), flush=True)
+            result['stage'] = 'controller_wait'
             deadline = time.monotonic() + args.hold_seconds
             while time.monotonic() < deadline:
                 checked_identity(ts_status(), args.operator_node)
@@ -285,21 +339,52 @@ def main():
         result['error_type'] = type(error).__name__
         raise
     finally:
-        if process is not None and process.poll() is None:
-            (state / 'stop').touch()
-            try:
-                process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
-        result['fixture_sha256'] = {}
-        for path in fixtures.rglob('*'):
-            if path.is_file() and not path.is_symlink():
-                with path.open('rb') as stream:
-                    result['fixture_sha256'][path.relative_to(fixtures).as_posix()] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        try:
+            if process is not None and process.poll() is None:
+                (state / 'stop').touch()
+                try:
+                    process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait(timeout=settings['shutdown_timeout_seconds'] + 15)
+        except Exception as error:
+            result['cleanup_error_type'] = type(error).__name__
+            result['passed'] = False
+        try:
+            result['fixture_sha256'] = {}
+            for path in fixtures.rglob('*'):
+                if path.is_file() and not path.is_symlink():
+                    with path.open('rb') as stream:
+                        result['fixture_sha256'][path.relative_to(fixtures).as_posix()] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        except Exception as error:
+            result['fixture_error_type'] = type(error).__name__
+            result['passed'] = False
         result['desktop_tool_calls'] = 0
-        write_json(output / 'final.json', result)
+
+
+def main():
+    result = {'schema': 1, 'passed': False, 'stage': 'arguments',
+              'runtime_version': {'host': list(sys.version_info[:3])}}
+    output = None
+    try:
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            output = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-output' / 'final.json'
+            output.parent.mkdir(exist_ok=True)
+        run(result)
+    except BaseException as error:
+        if isinstance(error, SystemExit) and error.code == 0:
+            return 0
+        result['error_type'] = type(error).__name__
+        result['passed'] = False
+    finally:
+        if output is not None:
+            write_json(output, result)
+    if output is not None:
+        print(json.dumps(result, ensure_ascii=True), flush=True)
+        return 0 if result['passed'] else 1
+    return 1 if 'error_type' in result else 0
+
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
