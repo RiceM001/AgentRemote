@@ -19,8 +19,8 @@ function Assert-Identity($actual, $expected) {
 function Get-Phase($ready, $final, $alive, $now, $deadline) {
     if ($now -ge $deadline) { return 'timeout' }
     if ($null -ne $final -and $final.passed -ne $true) { return 'failed' }
-    if ($null -ne $ready) { return 'ready' }
     if (-not $alive) { return 'exited' }
+    if ($null -ne $ready) { return 'ready' }
     return 'waiting'
 }
 
@@ -38,6 +38,7 @@ if ($Mode -eq 'SelfCheck') {
     if ((Get-Phase @{} $null $true 20 10) -ne 'timeout') { throw 'Late ready accepted' }
     if ((Get-Phase @{} @{passed=$false} $true 1 10) -ne 'failed') { throw 'Early failure ignored' }
     if ((Get-Phase $null $null $false 1 10) -ne 'exited') { throw 'Exited node accepted' }
+    if ((Get-Phase @{} $null $false 1 10) -ne 'exited') { throw 'Stale ready from an exited node accepted' }
     if ((Get-Phase @{} $null $true 1 10) -ne 'ready') { throw 'Ready node rejected' }
     if ((Get-Phase $null $null $true 1 10) -ne 'waiting') { throw 'Missing ready accepted' }
     '{"self_check":"passed","processes_started":false,"network_used":false}'
